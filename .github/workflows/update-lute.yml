@@ -24,8 +24,9 @@ jobs:
             curl -s https://api.github.com/repos/luau-lang/lute/releases \
             | jq -r 'map(select(.draft | not))[0]?.tag_name'
           )
-          echo "Latest Lute release: $LATEST_LUTE"
-          echo "tag=$LATEST_LUTE" >> $GITHUB_OUTPUT
+          LATEST_LUTE_VERSION="${LATEST_LUTE#v}"
+          echo "Latest Lute release: $LATEST_LUTE_VERSION"
+          echo "tag=$LATEST_LUTE_VERSION" >> $GITHUB_OUTPUT
 
       - name: Check current version
         id: current-version
