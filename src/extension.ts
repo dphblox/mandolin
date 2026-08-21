@@ -124,6 +124,7 @@ async function validateLuteExec(
 
   try {
     await execFilePromise(lutePath, ["lint", "-s", "return"], { cwd });
+    await execFilePromise(lutePath, ["debug", "-h"], { cwd });
     luteExecCache.set(cacheKey, true);
     log(`Lute validation succeeded for ${lutePath}`);
     return true;
@@ -194,6 +195,51 @@ async function getLutePath(): Promise<LutePathResult | null> {
   return { lutePath, foremanToml };
 }
 
+async function resolveLuteExecutable(
+  context: vscode.ExtensionContext,
+  workspaceRoot: string | undefined,
+  lutePathResult: LutePathResult | null,
+  fallbackCwd: string | undefined
+): Promise<{ lutePath: string; execCwd: string | undefined }> {
+  const mandolinConfig = vscode.workspace.getConfiguration("mandolin");
+  const bundledLutePath = vscode.Uri.joinPath(
+    context.extensionUri,
+    "bin",
+    "lute"
+  ).fsPath;
+
+  const candidateLutePath =
+    mandolinConfig.get("luteExecPath", "") || lutePathResult?.lutePath;
+
+  const foremanTomlPath =
+    mandolinConfig.get("foremanTomlPath", "") ||
+    lutePathResult?.foremanToml ||
+    undefined;
+  const resolvedForemanTomlPath = foremanTomlPath
+    ? resolveConfigPath(foremanTomlPath, workspaceRoot)
+    : undefined;
+  const foremanDirPath = resolvedForemanTomlPath
+    ? path.dirname(resolvedForemanTomlPath)
+    : undefined;
+
+  if (
+    candidateLutePath &&
+    (await validateLuteExec(candidateLutePath, foremanDirPath))
+  ) {
+    return {
+      lutePath: candidateLutePath,
+      execCwd: foremanDirPath ?? fallbackCwd,
+    };
+  }
+
+  if (candidateLutePath) {
+    log(
+      `Warning: Lute at ${candidateLutePath} failed to execute${foremanDirPath ? ` from directory: ${foremanDirPath}` : ""}. Falling back to bundled Lute.`
+    );
+  }
+  return { lutePath: bundledLutePath, execCwd: fallbackCwd };
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel("Mandolin");
   context.subscriptions.push(outputChannel);
@@ -230,45 +276,13 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     const mandolinConfig = vscode.workspace.getConfiguration("mandolin");
+    const { lutePath, execCwd: foremanDirPath } = await resolveLuteExecutable(
+      context,
+      workspaceRoot,
+      lutePathResult,
+      undefined
+    );
 
-    const bundledLutePath = vscode.Uri.joinPath(
-      context.extensionUri,
-      "bin",
-      "lute"
-    ).fsPath;
-
-    const candidateLutePath =
-      mandolinConfig.get("luteExecPath", "") || lutePathResult?.lutePath;
-
-    const foremanTomlPath =
-      mandolinConfig.get("foremanTomlPath", "") ||
-      lutePathResult?.foremanToml ||
-      undefined;
-    log(`foreman.toml: ${foremanTomlPath}`);
-    const resolvedForemanTomlPath =
-      foremanTomlPath !== undefined
-        ? resolveConfigPath(foremanTomlPath, workspaceRoot)
-        : undefined;
-
-    let foremanDirPath = resolvedForemanTomlPath
-      ? path.dirname(resolvedForemanTomlPath)
-      : undefined;
-
-    let lutePath: string;
-    if (
-      candidateLutePath &&
-      (await validateLuteExec(candidateLutePath, foremanDirPath))
-    ) {
-      lutePath = candidateLutePath;
-    } else {
-      if (candidateLutePath) {
-        log(
-          `Warning: Lute at ${candidateLutePath} failed to execute ${foremanDirPath ? `from directory: ${foremanDirPath}` : ""}. Falling back to bundled Lute.`
-        );
-      }
-      lutePath = bundledLutePath;
-      foremanDirPath = undefined;
-    }
     log(`Lute exec: ${lutePath}`);
 
     if (lutePath !== undefined) {
@@ -320,6 +334,73 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(lint));
 
   vscode.workspace.textDocuments.forEach(lint);
+
+  context.subscriptions.push(
+    vscode.debug.registerDebugAdapterDescriptorFactory("lute", {
+      createDebugAdapterDescriptor(session) {
+        return (async () => {
+          const { lutePath, execCwd: debugCwd } = await resolveLuteExecutable(
+            context,
+            workspaceRoot,
+            lutePathResult,
+            session.workspaceFolder?.uri.fsPath
+          );
+          log(
+            `Starting debug adapter: ${lutePath} debug serve (cwd: ${debugCwd ?? `process default (${process.cwd()})`})`
+          );
+          return new vscode.DebugAdapterExecutable(
+            lutePath,
+            ["debug", "serve"],
+            debugCwd ? { cwd: debugCwd } : undefined
+          );
+        })();
+      },
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.debug.registerDebugAdapterTrackerFactory("lute", {
+      createDebugAdapterTracker(session) {
+        if (!session.configuration.trace) {
+          return undefined;
+        }
+        let hasDisconnected = false;
+        return {
+          onWillStartSession() {
+            log(`Mandolin debug: Starting Lute debug session ${session.id}`);
+          },
+          onWillStopSession() {
+            log(`Mandolin debug: Stopping Lute debug session ${session.id}`);
+          },
+          onWillReceiveMessage(message) {
+            if (message.command === "disconnect") {
+              hasDisconnected = true;
+            }
+            log(
+              `Mandolin debug: Received by DAP adapter: ${JSON.stringify(message)}`
+            );
+          },
+          onDidSendMessage(message) {
+            log(
+              `Mandolin debug: Sent by DAP adapter: ${JSON.stringify(message)}`
+            );
+          },
+          onError(error) {
+            if (hasDisconnected && error.message === "read error") {
+              log("Mandolin debug: read error after disconnect (expected)");
+            } else {
+              log(`Mandolin debug: error: ${error.message}`);
+            }
+          },
+          onExit(code, signal) {
+            log(
+              `Mandolin debug: DAP adapter exited (code=${code}, signal=${signal})`
+            );
+          },
+        };
+      },
+    })
+  );
 
   log("Mandolin !");
 }
